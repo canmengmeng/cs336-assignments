@@ -1,0 +1,19 @@
+[project]
+name = "cs336-assignment1-basics"
+version = "0.1.0"
+description = "CS336 Assignment 1: Basics — Language Modeling From Scratch"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "datasets>=2.14.0",
+    "tiktoken>=0.5.0",
+    "blobfile>=2.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+    "pytest-timeout>=2.0.0",
+]
