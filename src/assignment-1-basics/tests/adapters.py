@@ -122,7 +122,18 @@ def run_scaled_dot_product_attention(
     Returns:
         Attention output of shape (batch, num_heads, seq_len, d_v)
     """
-    raise NotImplementedError
+    d_k = q.shape[-1]
+    # 1. Q @ K^T / √d_k: (batch, heads, seq_q, d_k) @ (batch, heads, d_k, seq_k)
+    #    einsum: ...ik,...jk->...ij  (i=query位置, j=key位置, k=特征维度)
+    scores = torch.einsum('...ik,...jk->...ij', q, k) / (d_k ** 0.5)
+    # 2. Mask: False 的位置设为 -∞，softmax 后变成 0
+    if mask is not None:
+        scores = scores.masked_fill(~mask, float('-inf'))
+    # 3. Softmax: 沿 key 维度归一化
+    weights = run_softmax(scores, dim=-1)
+    # 4. 加权求和: weights @ V
+    #    einsum: ...ij,...jk->...ik  (i=query位置, j=key位置, k=特征维度)
+    return torch.einsum('...ij,...jk->...ik', weights, v)
 
 
 def run_multihead_self_attention(
@@ -148,7 +159,27 @@ def run_multihead_self_attention(
     Returns:
         Output tensor of shape (batch, seq_len, d_model)
     """
-    raise NotImplementedError
+    batch, seq_len, _ = in_features.shape
+    d_k = d_model // num_heads
+
+    # 1. 线性投影: (*, d_model) → (*, d_model)
+    Q = torch.einsum('...i,ji->...j', in_features, q_proj_weight)
+    K = torch.einsum('...i,ji->...j', in_features, k_proj_weight)
+    V = torch.einsum('...i,ji->...j', in_features, v_proj_weight)
+
+    # 2. 拆分多头: (batch, seq, d_model) → (batch, num_heads, seq, d_k)
+    Q = Q.reshape(batch, seq_len, num_heads, d_k).transpose(1, 2)
+    K = K.reshape(batch, seq_len, num_heads, d_k).transpose(1, 2)
+    V = V.reshape(batch, seq_len, num_heads, d_k).transpose(1, 2)
+
+    # 3. 缩放点积注意力
+    attn_output = run_scaled_dot_product_attention(Q, K, V)
+
+    # 4. 合并多头: (batch, num_heads, seq, d_k) → (batch, seq, d_model)
+    attn_output = attn_output.transpose(1, 2).reshape(batch, seq_len, d_model)
+
+    # 5. 输出投影
+    return torch.einsum('...i,ji->...j', attn_output, o_proj_weight)
 
 
 def run_multihead_self_attention_with_rope(
@@ -180,7 +211,40 @@ def run_multihead_self_attention_with_rope(
     Returns:
         Output tensor of shape (batch, seq_len, d_model)
     """
-    raise NotImplementedError
+    batch, seq_len, _ = in_features.shape
+    d_k = d_model // num_heads
+
+    # 1. 线性投影
+    Q = torch.einsum('...i,ji->...j', in_features, q_proj_weight)
+    K = torch.einsum('...i,ji->...j', in_features, k_proj_weight)
+    V = torch.einsum('...i,ji->...j', in_features, v_proj_weight)
+
+    # 2. 拆分多头: (batch, seq, d_model) → (batch, num_heads, seq, d_k)
+    Q = Q.reshape(batch, seq_len, num_heads, d_k).transpose(1, 2)
+    K = K.reshape(batch, seq_len, num_heads, d_k).transpose(1, 2)
+    V = V.reshape(batch, seq_len, num_heads, d_k).transpose(1, 2)
+
+    # 3. 对 Q 和 K 应用 RoPE（每个头独立处理）
+    #    RoPE 输入形状: (batch, seq, d_k)
+    #    需要 reshape: (batch * num_heads, seq, d_k)
+    Q_flat = Q.reshape(batch * num_heads, seq_len, d_k)
+    K_flat = K.reshape(batch * num_heads, seq_len, d_k)
+
+    Q_rotated = run_rope(d_k, theta, max_seq_len, Q_flat, token_positions)
+    K_rotated = run_rope(d_k, theta, max_seq_len, K_flat, token_positions)
+
+    # reshape 回多头形状
+    Q = Q_rotated.reshape(batch, num_heads, seq_len, d_k)
+    K = K_rotated.reshape(batch, num_heads, seq_len, d_k)
+
+    # 4. 缩放点积注意力
+    attn_output = run_scaled_dot_product_attention(Q, K, V)
+
+    # 5. 合并多头
+    attn_output = attn_output.transpose(1, 2).reshape(batch, seq_len, d_model)
+
+    # 6. 输出投影
+    return torch.einsum('...i,ji->...j', attn_output, o_proj_weight)
 
 
 def run_rope(
@@ -202,7 +266,33 @@ def run_rope(
     Returns:
         Rotated tensor of same shape as input
     """
-    raise NotImplementedError
+    # 1. 计算频率: θ_i = theta^(-2i/d_model), i = 0, 1, ..., d_model/2 - 1
+    #    freqs 形状: (d_model/2,)
+    i = torch.arange(d_model // 2, device=in_query_or_key.device, dtype=torch.float32)
+    freqs = 1.0 / (theta ** (2 * i / d_model))
+    # 2. 计算旋转角度: positions × freqs
+    #    positions: (batch, seq_len) → (batch, seq_len, 1)
+    #    freqs: (d_model/2,) → (1, 1, d_model/2)
+    #    angles: (batch, seq_len, d_model/2)
+    if token_positions is None:
+        token_positions = torch.arange(in_query_or_key.shape[1], device=in_query_or_key.device)
+    angles = token_positions.float()[..., None] * freqs
+    # 3. 构造旋转: cos 和 sin
+    cos_angles = torch.cos(angles)  # (batch, seq_len, d_model/2)
+    sin_angles = torch.sin(angles)  # (batch, seq_len, d_model/2)
+    # 4. 拆分输入为偶数和奇数维度
+    #    x_even: [..., 0, 2, 4, ...],  x_odd: [..., 1, 3, 5, ...]
+    x_even = in_query_or_key[..., 0::2]  # (batch, seq_len, d_model/2)
+    x_odd = in_query_or_key[..., 1::2]   # (batch, seq_len, d_model/2)
+    # 5. 应用旋转矩阵:
+    #    [x_even'] = cos * x_even - sin * x_odd
+    #    [x_odd']  = sin * x_even + cos * x_odd
+    out_even = cos_angles * x_even - sin_angles * x_odd
+    out_odd = sin_angles * x_even + cos_angles * x_odd
+    # 6. 交错合并回原形状
+    result = torch.stack([out_even, out_odd], dim=-1)  # (batch, seq, d/2, 2)
+    result = result.reshape(in_query_or_key.shape)
+    return result
 
 
 # ============================================================================
@@ -246,7 +336,28 @@ def run_transformer_block(
     Returns:
         Output tensor of shape (batch, seq_len, d_model)
     """
-    raise NotImplementedError
+    # 1. 注意力子层: x + MHA(RMSNorm(x))
+    normed1 = run_rmsnorm(d_model, 1e-5, weights['ln1.weight'], in_features)
+    attn_out = run_multihead_self_attention_with_rope(
+        d_model, num_heads, max_seq_len, theta,
+        weights['attn.q_proj.weight'],
+        weights['attn.k_proj.weight'],
+        weights['attn.v_proj.weight'],
+        weights['attn.o_proj.weight'],
+        normed1
+    )
+    h = in_features + attn_out
+
+    # 2. FFN 子层: h + SwiGLU(RMSNorm(h))
+    normed2 = run_rmsnorm(d_model, 1e-5, weights['ln2.weight'], h)
+    ffn_out = run_swiglu(
+        d_model, d_ff,
+        weights['ffn.w1.weight'],
+        weights['ffn.w2.weight'],
+        weights['ffn.w3.weight'],
+        normed2
+    )
+    return h + ffn_out
 
 
 def run_transformer_lm(
@@ -283,7 +394,31 @@ def run_transformer_lm(
     Returns:
         Unnormalized logits of shape (batch, seq_len, vocab_size)
     """
-    raise NotImplementedError
+    # 1. Token 嵌入: (batch, seq) → (batch, seq, d_model)
+    x = run_embedding(vocab_size, d_model, weights['token_embeddings.weight'], in_indices)
+
+    # 2. N 层 Transformer Block
+    for i in range(num_layers):
+        layer_weights = {
+            'attn.q_proj.weight': weights[f'layers.{i}.attn.q_proj.weight'],
+            'attn.k_proj.weight': weights[f'layers.{i}.attn.k_proj.weight'],
+            'attn.v_proj.weight': weights[f'layers.{i}.attn.v_proj.weight'],
+            'attn.o_proj.weight': weights[f'layers.{i}.attn.o_proj.weight'],
+            'ln1.weight': weights[f'layers.{i}.ln1.weight'],
+            'ffn.w1.weight': weights[f'layers.{i}.ffn.w1.weight'],
+            'ffn.w2.weight': weights[f'layers.{i}.ffn.w2.weight'],
+            'ffn.w3.weight': weights[f'layers.{i}.ffn.w3.weight'],
+            'ln2.weight': weights[f'layers.{i}.ln2.weight'],
+        }
+        x = run_transformer_block(d_model, num_heads, d_ff, max_seq_len, theta, layer_weights, x)
+
+    # 3. 最终 RMSNorm
+    x = run_rmsnorm(d_model, 1e-5, weights['ln_final.weight'], x)
+
+    # 4. LM Head (权重绑定): logits = x @ embed_weights^T
+    logits = torch.einsum('...i,ji->...j', x, weights['token_embeddings.weight'])
+
+    return logits
 
 
 # ============================================================================
@@ -416,7 +551,26 @@ def run_gradient_clipping(
         parameters: Single parameter or iterable of parameters
         max_l2_norm: Maximum allowed L2 norm
     """
-    raise NotImplementedError
+    # 1. 统一处理：单个参数也变成列表
+    if isinstance(parameters, torch.nn.Parameter):
+        params = [parameters]
+    else:
+        params = list(parameters)
+
+    # 2. 收集有梯度的参数
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        return
+
+    # 3. 计算总 L2 范数: √(Σ ‖gᵢ‖²)
+    total_norm_sq = sum(torch.sum(g ** 2) for g in grads)
+    total_norm = torch.sqrt(total_norm_sq)
+
+    # 4. 如果超过阈值，等比例缩放
+    if total_norm > max_l2_norm:
+        scale = max_l2_norm / total_norm
+        for g in grads:
+            g.mul_(scale)  # 原地缩放
 
 
 def get_adamw_cls() -> type[torch.optim.Optimizer]:
@@ -425,7 +579,53 @@ def get_adamw_cls() -> type[torch.optim.Optimizer]:
     Returns:
         A class that can be instantiated with model parameters and hyperparameters
     """
-    raise NotImplementedError
+    class AdamW(torch.optim.Optimizer):
+        """AdamW optimizer with decoupled weight decay."""
+
+        def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
+            defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+            super().__init__(params, defaults)
+
+        @torch.no_grad()
+        def step(self):
+            for group in self.param_groups:
+                lr = group['lr']
+                beta1, beta2 = group['betas']
+                eps = group['eps']
+                weight_decay = group['weight_decay']
+
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+
+                    grad = p.grad
+                    state = self.state[p]
+
+                    # 初始化状态
+                    if len(state) == 0:
+                        state['step'] = 0
+                        state['m'] = torch.zeros_like(p)  # 一阶动量
+                        state['v'] = torch.zeros_like(p)  # 二阶动量
+
+                    m, v = state['m'], state['v']
+                    state['step'] += 1
+                    t = state['step']
+
+                    # 更新动量
+                    m.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    v.mul_(beta2).add_(grad ** 2, alpha=1 - beta2)
+
+                    # 偏差修正
+                    m_hat = m / (1 - beta1 ** t)
+                    v_hat = v / (1 - beta2 ** t)
+
+                    # AdamW: 解耦权重衰减
+                    # 1. 先衰减参数: θ = θ · (1 - lr · λ)
+                    p.mul_(1 - lr * weight_decay)
+                    # 2. 再用 Adam 更新: θ = θ - lr · m̂/(√v̂ + ε)
+                    p.add_(m_hat / (v_hat.sqrt() + eps), alpha=-lr)
+
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -447,7 +647,19 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate for the current iteration
     """
-    raise NotImplementedError
+    import math
+
+    # 阶段 1: 线性预热
+    if it < warmup_iters:
+        return max_learning_rate * (it / warmup_iters)
+
+    # 阶段 2: 余弦退火
+    if it <= cosine_cycle_iters:
+        t = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+        return min_learning_rate + 0.5 * (max_learning_rate - min_learning_rate) * (1 + math.cos(math.pi * t))
+
+    # 阶段 3: 保持最小学习率
+    return min_learning_rate
 
 
 def run_save_checkpoint(
@@ -464,7 +676,12 @@ def run_save_checkpoint(
         iteration: Current training iteration
         out: File path or file-like object to save to
     """
-    raise NotImplementedError
+    checkpoint = {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'iteration': iteration,
+    }
+    torch.save(checkpoint, out)
 
 
 def run_load_checkpoint(
@@ -482,7 +699,10 @@ def run_load_checkpoint(
     Returns:
         The iteration number from the checkpoint
     """
-    raise NotImplementedError
+    checkpoint = torch.load(f, weights_only=True)
+    model.load_state_dict(checkpoint['model'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    return checkpoint['iteration']
 
 
 # ============================================================================
@@ -504,7 +724,84 @@ def get_tokenizer(
     Returns:
         A tokenizer instance
     """
-    raise NotImplementedError
+    class Tokenizer:
+        def __init__(self, vocab, merges, special_tokens):
+            self.vocab = vocab                          # id → bytes
+            self.vocab_reverse = {v: k for k, v in vocab.items()}  # bytes → id
+            self.merges = merges
+            self.special_tokens = special_tokens or []
+            # 合并优先级: merges 列表中越靠前优先级越高
+            self.merge_priority = {(a, b): i for i, (a, b) in enumerate(merges)}
+
+        def encode(self, text: str) -> list[int]:
+            """编码: 文本 → token IDs"""
+            # 1. 处理特殊 token
+            tokens = []
+            # 先按特殊 token 分割
+            parts = [text]
+            for st in self.special_tokens:
+                new_parts = []
+                for part in parts:
+                    if part == st:
+                        new_parts.append(st)
+                    else:
+                        new_parts.extend(part.split(st))
+                parts = new_parts
+
+            # 2. 对每个非特殊部分应用 BPE
+            for part in parts:
+                if part in self.special_tokens:
+                    tokens.append(self.vocab_reverse[part.encode('utf-8')])
+                else:
+                    tokens.extend(self._bpe_encode(part))
+
+            return tokens
+
+        def _bpe_encode(self, text: str) -> list[int]:
+            """对普通文本应用 BPE 编码"""
+            # 转成字节序列
+            symbols = [bytes([b]) for b in text.encode('utf-8')]
+
+            # 反复合并直到无法合并
+            while len(symbols) > 1:
+                # 找最高优先级的可合并 pair
+                best_pair = None
+                best_priority = float('inf')
+
+                for i in range(len(symbols) - 1):
+                    pair = (symbols[i], symbols[i + 1])
+                    if pair in self.merge_priority:
+                        priority = self.merge_priority[pair]
+                        if priority < best_priority:
+                            best_priority = priority
+                            best_pair = pair
+
+                if best_pair is None:
+                    break  # 没有可合并的 pair
+
+                # 执行合并
+                new_symbols = []
+                i = 0
+                while i < len(symbols):
+                    if i < len(symbols) - 1 and (symbols[i], symbols[i + 1]) == best_pair:
+                        new_symbols.append(symbols[i] + symbols[i + 1])
+                        i += 2
+                    else:
+                        new_symbols.append(symbols[i])
+                        i += 1
+                symbols = new_symbols
+
+            # 查词表得到 token IDs
+            return [self.vocab_reverse[s] for s in symbols]
+
+        def decode(self, ids: list[int]) -> str:
+            """解码: token IDs → 文本"""
+            result = b''
+            for token_id in ids:
+                result += self.vocab[token_id]
+            return result.decode('utf-8', errors='replace')
+
+    return Tokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
@@ -524,4 +821,72 @@ def run_train_bpe(
             - vocab: Dictionary mapping token IDs to byte sequences
             - merges: List of merge operations as (bytes, bytes) pairs
     """
-    raise NotImplementedError
+    from collections import Counter
+
+    # 1. 读取语料
+    with open(input_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    # 2. 初始化词表: 256 个字节 + 特殊 token
+    vocab = {}
+    token_id = 0
+
+    # 添加特殊 token
+    for st in special_tokens:
+        vocab[token_id] = st.encode('utf-8')
+        token_id += 1
+
+    # 添加 256 个基础字节
+    for i in range(256):
+        vocab[token_id] = bytes([i])
+        token_id += 1
+
+    # 3. 把语料拆成字节序列（按行处理，每行独立）
+    lines = text.split('\n')
+    corpus = []
+    for line in lines:
+        line_bytes = line.encode('utf-8')
+        # 每行拆成字节序列
+        word = tuple(bytes([b]) for b in line_bytes)
+        corpus.append(word)
+
+    # 4. 循环合并直到达到词表大小
+    merges = []
+    num_merges = vocab_size - len(vocab)
+
+    for _ in range(num_merges):
+        # a. 统计所有相邻 pair 频率
+        pair_counts = Counter()
+        for word in corpus:
+            for i in range(len(word) - 1):
+                pair = (word[i], word[i + 1])
+                pair_counts[pair] += 1
+
+        if not pair_counts:
+            break  # 没有可合并的 pair
+
+        # b. 找最高频 pair
+        best_pair = max(pair_counts, key=pair_counts.get)
+
+        # c. 合并: 更新语料表示
+        new_token = best_pair[0] + best_pair[1]
+        new_corpus = []
+        for word in corpus:
+            new_word = []
+            i = 0
+            while i < len(word):
+                if i < len(word) - 1 and (word[i], word[i + 1]) == best_pair:
+                    new_word.append(new_token)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            new_corpus.append(tuple(new_word))
+        corpus = new_corpus
+
+        # d. 添加到词表和合并规则
+        vocab[token_id] = new_token
+        merges.append(best_pair)
+        token_id += 1
+
+    return vocab, merges
