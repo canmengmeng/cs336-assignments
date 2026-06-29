@@ -33,14 +33,18 @@ ENV/
 
 # Data
 data/
-*.txt
-*.json
-*.jsonl
 
 # Checkpoints
-*.pt
-*.pth
 checkpoint/
+
+# Test fixtures (allow these files)
+!tests/fixtures/
+!tests/fixtures/**
+!*.txt
+!*.json
+!*.jsonl
+!*.pt
+!*.pth
 
 # Logs
 *.log

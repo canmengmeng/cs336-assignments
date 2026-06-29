@@ -36,12 +36,12 @@ src/assignment-1-basics/
 
 ## 实现任务清单
 
-### Part 1: 核心组件 (5 个)
-- [ ] `run_linear` — 线性变换 y = x @ W^T
-- [ ] `run_embedding` — 嵌入查找
-- [ ] `run_rmsnorm` — RMSNorm 归一化
-- [ ] `run_silu` — SiLU 激活函数
-- [ ] `run_softmax` — Softmax 函数
+### Part 1: 核心组件 (5 个) ✅ 已完成
+- [x] `run_linear` — 线性变换 y = x @ W^T
+- [x] `run_embedding` — 嵌入查找
+- [x] `run_rmsnorm` — RMSNorm 归一化
+- [x] `run_silu` — SiLU 激活函数
+- [x] `run_softmax` — Softmax 函数
 
 ### Part 2: 注意力机制 (4 个)
 - [ ] `run_scaled_dot_product_attention` — 缩放点积注意力
@@ -53,9 +53,9 @@ src/assignment-1-basics/
 - [ ] `run_transformer_block` — 单个 Transformer 块
 - [ ] `run_transformer_lm` — 完整 Transformer 语言模型
 
-### Part 4: 训练组件 (5 个)
-- [ ] `run_cross_entropy` — 交叉熵损失
-- [ ] `run_get_batch` — 批数据采样
+### Part 4: 训练组件 (5 个) 🚧 进行中
+- [x] `run_cross_entropy` — 交叉熵损失
+- [x] `run_get_batch` — 批数据采样
 - [ ] `run_gradient_clipping` — 梯度裁剪
 - [ ] `get_adamw_cls` — AdamW 优化器
 - [ ] `run_get_lr_cosine_schedule` — 余弦学习率调度
@@ -67,6 +67,9 @@ src/assignment-1-basics/
 ### Part 6: 分词器 (2 个)
 - [ ] `get_tokenizer` — BPE 分词器构建
 - [ ] `run_train_bpe` — BPE 训练
+
+### 额外实现
+- [x] `run_swiglu` — SwiGLU 激活函数（FFN 核心组件）
 
 ## 运行命令
 

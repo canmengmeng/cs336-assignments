@@ -58,6 +58,27 @@ uv run pytest
 3. **训练基础设施** — AdamW、余弦学习率、梯度裁剪
 4. **检查点管理** — 模型保存与加载
 
+### 实现进度 (8/20)
+
+| Part | 任务 | 状态 |
+|------|------|------|
+| Part 1 | 核心组件 (5) | ✅ 全部完成 |
+| Part 2 | 注意力机制 (4) | ⏳ 待开始 |
+| Part 3 | Transformer 架构 (2) | ⏳ 待开始 |
+| Part 4 | 训练组件 (5) | 🚧 进行中 (2/5) |
+| Part 5 | 检查点管理 (2) | ⏳ 待开始 |
+| Part 6 | 分词器 (2) | ⏳ 待开始 |
+
+**已完成的核心组件：**
+- ✅ `run_silu` — SiLU 激活函数
+- ✅ `run_softmax` — Softmax 函数
+- ✅ `run_rmsnorm` — RMSNorm 归一化
+- ✅ `run_linear` — 线性变换
+- ✅ `run_embedding` — 嵌入查找
+- ✅ `run_cross_entropy` — 交叉熵损失
+- ✅ `run_get_batch` — 批数据采样
+- ✅ `run_swiglu` — SwiGLU 激活函数
+
 详细说明见 [assignment-1-basics/README.md](src/assignment-1-basics/README.md)
 
 ## 学习资源
