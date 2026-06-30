@@ -6,9 +6,15 @@ from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
+import regex
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+# GPT-2 pretokenization regex pattern (using regex module for \p{L} support)
+GPT2_PRETOKENIZE_PAT = regex.compile(
+    r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+)
 
 
 def run_linear(
@@ -445,35 +451,36 @@ def get_tokenizer(
             return parts
 
         def _bpe_encode(self, text: str) -> list[int]:
-            symbols = [bytes([b]) for b in text.encode('utf-8')]
-
-            while len(symbols) > 1:
-                best_pair = None
-                best_priority = float('inf')
-
-                for i in range(len(symbols) - 1):
-                    pair = (symbols[i], symbols[i + 1])
-                    if pair in self.merge_priority:
-                        priority = self.merge_priority[pair]
-                        if priority < best_priority:
-                            best_priority = priority
-                            best_pair = pair
-
-                if best_pair is None:
-                    break
-
-                new_symbols = []
-                i = 0
-                while i < len(symbols):
-                    if i < len(symbols) - 1 and (symbols[i], symbols[i + 1]) == best_pair:
-                        new_symbols.append(symbols[i] + symbols[i + 1])
-                        i += 2
-                    else:
-                        new_symbols.append(symbols[i])
-                        i += 1
-                symbols = new_symbols
-
-            return [self.vocab_reverse[s] for s in symbols]
+            # Use GPT-2 pretokenization regex to split into words first
+            # This prevents e.g. \n\n from being merged into a single token
+            words = GPT2_PRETOKENIZE_PAT.findall(text)
+            all_token_ids = []
+            for word in words:
+                symbols = [bytes([b]) for b in word.encode('utf-8')]
+                while len(symbols) > 1:
+                    best_pair = None
+                    best_priority = float('inf')
+                    for i in range(len(symbols) - 1):
+                        pair = (symbols[i], symbols[i + 1])
+                        if pair in self.merge_priority:
+                            priority = self.merge_priority[pair]
+                            if priority < best_priority:
+                                best_priority = priority
+                                best_pair = pair
+                    if best_pair is None:
+                        break
+                    new_symbols = []
+                    i = 0
+                    while i < len(symbols):
+                        if i < len(symbols) - 1 and (symbols[i], symbols[i + 1]) == best_pair:
+                            new_symbols.append(symbols[i] + symbols[i + 1])
+                            i += 2
+                        else:
+                            new_symbols.append(symbols[i])
+                            i += 1
+                    symbols = new_symbols
+                all_token_ids.extend(self.vocab_reverse[s] for s in symbols)
+            return all_token_ids
 
         def decode(self, ids: list[int]) -> str:
             result = b''
@@ -494,8 +501,8 @@ def run_train_bpe(
     vocab_size: int,
     special_tokens: list[str],
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Train BPE tokenizer with optimized incremental pair counting"""
-    from collections import Counter, defaultdict
+    """Train BPE tokenizer"""
+    from collections import Counter
 
     with open(input_path, 'r', encoding='utf-8') as f:
         text = f.read()
@@ -510,55 +517,53 @@ def run_train_bpe(
         vocab[token_id] = bytes([i])
         token_id += 1
 
-    # 按行处理，每行独立
+    # 先按特殊 token 分割文本，只处理非特殊 token 部分
+    # 特殊 token 不参与 BPE 训练
+    parts = [text]
+    for st in special_tokens:
+        new_parts = []
+        for part in parts:
+            segments = part.split(st)
+            for i, seg in enumerate(segments):
+                if i > 0:
+                    # 这是特殊 token 的位置，跳过（不参与训练）
+                    pass
+                if seg:
+                    new_parts.append(seg)
+        parts = new_parts
+
+    # 使用 GPT-2 regex 进行 pretokenization
     word_freq = Counter()
-    for line in text.split('\n'):
-        if not line:
-            continue
-        word_freq[tuple(bytes([b]) for b in line.encode('utf-8'))] += 1
-
-    # 初始化: pair -> {word_idx: count_in_word}
-    pair_in_word = defaultdict(lambda: defaultdict(int))
-    pair_counts = Counter()
-    word_list = list(word_freq.keys())
-    word_freqs = [word_freq[w] for w in word_list]
-
-    for idx, word in enumerate(word_list):
-        for i in range(len(word) - 1):
-            pair = (word[i], word[i + 1])
-            pair_in_word[pair][idx] += 1
-            pair_counts[pair] += word_freqs[idx]
+    for part in parts:
+        words = GPT2_PRETOKENIZE_PAT.findall(part)
+        for word in words:
+            word_freq[tuple(bytes([b]) for b in word.encode('utf-8'))] += 1
 
     merges = []
     num_merges = vocab_size - len(vocab)
 
     for _ in range(num_merges):
+        # 统计 pair 频率
+        pair_counts = Counter()
+        for word, freq in word_freq.items():
+            for i in range(len(word) - 1):
+                pair_counts[(word[i], word[i + 1])] += freq
+
         if not pair_counts:
             break
 
         # 找最高频 pair
-        best_pair = max(pair_counts, key=pair_counts.get)
+        max_count = max(pair_counts.values())
+        # 频率相同时，按 pair 元组的字典序最大（与 GPT-2 一致）
+        best_pair = max(
+            (pair for pair, count in pair_counts.items() if count == max_count),
+        )
         new_token = best_pair[0] + best_pair[1]
         bp0, bp1 = best_pair
 
-        # 获取受影响的 word indices
-        affected = pair_in_word.pop(best_pair, {})
-        if not affected:
-            break
-
-        for idx, count_in_word in affected.items():
-            word = word_list[idx]
-            freq = word_freqs[idx]
-
-            # 移除旧 pair 计数
-            for i in range(len(word) - 1):
-                pair = (word[i], word[i + 1])
-                pair_counts[pair] -= freq
-                pair_in_word[pair][idx] -= 1
-                if pair_in_word[pair][idx] <= 0:
-                    del pair_in_word[pair][idx]
-
-            # 执行合并
+        # 合并
+        new_word_freq = Counter()
+        for word, freq in word_freq.items():
             new_word = []
             i = 0
             wlen = len(word)
@@ -569,18 +574,9 @@ def run_train_bpe(
                 else:
                     new_word.append(word[i])
                     i += 1
-            new_word = tuple(new_word)
-            word_list[idx] = new_word
+            new_word_freq[tuple(new_word)] += freq
 
-            # 添加新 pair 计数
-            for i in range(len(new_word) - 1):
-                pair = (new_word[i], new_word[i + 1])
-                pair_counts[pair] += freq
-                pair_in_word[pair][idx] += 1
-
-        # 清理零计数
-        pair_counts = +pair_counts
-
+        word_freq = new_word_freq
         vocab[token_id] = new_token
         merges.append(best_pair)
         token_id += 1
